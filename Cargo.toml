@@ -1,0 +1,43 @@
+[package]
+name = "weedtime-bot"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dotenv = "*"
+tracing = "*"
+tracing-subscriber = "*"
+sys-info = "*"
+
+[dependencies.tokio]
+features = ["macros", "signal", "rt-multi-thread"]
+version = "*"
+
+[dependencies.bonsaidb]
+features = ["local"]
+version = "*"
+
+[dependencies.serde]
+features = ["derive"]
+version = "*"
+
+[dependencies.chrono]
+default-features = false
+features = ["clock"]
+version = "*"
+
+[dependencies.serenity]
+features = [
+  "cache",
+  "framework",
+  "standard_framework",
+  "rustls_backend",
+  "client",
+  "gateway",
+  "model",
+  "collector",
+  "builder",
+]
+version = "*"
