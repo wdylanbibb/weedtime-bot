@@ -1,10 +1,12 @@
 mod commands;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     env,
+    hash::Hash,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::channel,
         Arc,
     },
     time::Duration,
@@ -15,7 +17,7 @@ use serenity::{
     async_trait,
     client::bridge::gateway::ShardManager,
     framework::{standard::macros::group, StandardFramework},
-    http::Http,
+    http::{CacheHttp, Http},
     model::{
         gateway::Ready,
         prelude::{Activity, ChannelId, GuildId, Message},
@@ -46,7 +48,8 @@ impl TypeMapKey for MessageCount {
     // kinds of atomic operators.
     //
     // Arc should stay, to allow for the data lock to be closed early.
-    type Value = Arc<AtomicUsize>;
+    // type Value = Arc<AtomicUsize>;
+    type Value = Arc<RwLock<HashMap<ChannelId, VecDeque<Message>>>>;
 }
 
 struct Handler {
@@ -57,11 +60,13 @@ struct Handler {
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
         // We are verifying if the bot id is the same as the message author id.
-        if msg.author.id != ctx.cache.current_user_id()
-            && msg.content.to_lowercase().contains("owo")
-        {
+        if msg.author.id != ctx.cache.current_user_id() {
+            let channel_id = match msg.channel(&ctx.http).await {
+                Ok(channel) => channel.id(),
+                Err(_) => return,
+            };
             // Since data is located in Context, this means you are also able to use it within events!
-            let count = {
+            let raw_messages = {
                 let data_read = ctx.data.read().await;
                 data_read
                     .get::<MessageCount>()
@@ -69,13 +74,56 @@ impl EventHandler for Handler {
                     .clone()
             };
 
+            let mut messages = raw_messages.write().await;
+
             // Here, we are checking how many "owo" there are in the message content.
-            let owo_in_msg = msg.content.to_ascii_lowercase().matches("owo").count();
+            // let owo_in_msg = msg.content.to_ascii_lowercase().matches("owo").count();
 
             // Atomic operations with ordering do not require mut to be modified.
             // In this case, we want to increase the message count by 1.
             // https://doc.rust-lang.org/std/sync/atomic/struct.AtomicUsize.html#method.fetch_add
-            count.fetch_add(owo_in_msg, Ordering::SeqCst);
+            // count.fetch_add(owo_in_msg, Ordering::SeqCst);
+
+            fn has_unique_elements<T>(iter: T) -> bool
+            where
+                T: IntoIterator,
+                T::Item: Eq + Hash,
+            {
+                let mut uniq = HashSet::new();
+                iter.into_iter().all(move |x| uniq.insert(x))
+            }
+
+            match messages.get_mut(&channel_id) {
+                Some(messages) => {
+                    messages.push_back(msg);
+                    if messages.len() > 3 {
+                        messages.pop_front();
+                    }
+                    if messages.len() == 3
+                        && messages
+                            .make_contiguous()
+                            .windows(2)
+                            .all(|w| w[0].content_safe(&ctx) == w[1].content_safe(&ctx))
+                        && has_unique_elements(
+                            messages
+                                .make_contiguous()
+                                .into_iter()
+                                .map(|f| f.author.id)
+                                .collect::<Vec<_>>(),
+                        )
+                    {
+                        let content = messages.get(0).unwrap().content_safe(&ctx);
+                        if let Err(why) = channel_id.say(&ctx.http, &content).await {
+                            error!("Error saying '{}' in channel: {why:?}", &content);
+                        }
+
+                        messages.clear();
+                    }
+                }
+                None => {
+                    messages.insert(channel_id, vec![msg].into());
+                }
+            }
         }
     }
 
@@ -167,7 +215,7 @@ async fn set_status_to_current_time(ctx: Arc<Context>) {
 }
 
 #[group]
-#[commands(ping, owo_count)]
+#[commands(ping)]
 struct General;
 
 #[tokio::main]
@@ -216,7 +264,7 @@ async fn main() {
     {
         let mut data = client.data.write().await;
         data.insert::<ShardManagerContainer>(client.shard_manager.clone());
-        data.insert::<MessageCount>(Arc::new(AtomicUsize::new(0)));
+        data.insert::<MessageCount>(Arc::new(RwLock::new(HashMap::new())));
     }
 
     let shard_manager = client.shard_manager.clone();
@@ -232,4 +280,3 @@ async fn main() {
         error!("Client error: {:?}", why);
     }
 }
-
