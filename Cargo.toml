@@ -23,6 +23,10 @@ version = "*"
 features = ["derive"]
 version = "*"
 
+[dependencies.dashmap]
+features = ["serde"]
+version = "*"
+
 [dependencies.chrono]
 default-features = false
 features = ["clock"]

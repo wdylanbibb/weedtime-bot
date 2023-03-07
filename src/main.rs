@@ -1,32 +1,22 @@
 mod commands;
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    env,
-    hash::Hash,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::channel,
-        Arc,
-    },
-    time::Duration,
-};
+use std::{collections::HashSet, env, sync::Arc};
 
-use chrono::Utc;
+use chrono::Timelike;
+use dashmap::{try_result::TryResult, DashMap};
 use serenity::{
     async_trait,
     client::bridge::gateway::ShardManager,
     framework::{standard::macros::group, StandardFramework},
-    http::{CacheHttp, Http},
+    http::Http,
     model::{
         gateway::Ready,
-        prelude::{Activity, ChannelId, GuildId, Message},
+        prelude::{ChannelId, GuildId, Message, UserId},
     },
     prelude::*,
 };
 use tracing::{error, info};
 
-use crate::commands::owo_count::*;
 use crate::commands::ping::*;
 
 // Weed time bot
@@ -40,6 +30,16 @@ impl TypeMapKey for ShardManagerContainer {
     type Value = Arc<Mutex<ShardManager>>;
 }
 
+#[derive(Debug)]
+struct WeedTimeMessage {
+    // The previous message that was sent in the channel
+    msg: Message,
+    // The users that have done a successful weed time message
+    users: Vec<UserId>,
+    // The number of successive weed time messages
+    count: u32,
+}
+
 struct MessageCount;
 
 impl TypeMapKey for MessageCount {
@@ -49,169 +49,161 @@ impl TypeMapKey for MessageCount {
     //
     // Arc should stay, to allow for the data lock to be closed early.
     // type Value = Arc<AtomicUsize>;
-    type Value = Arc<RwLock<HashMap<ChannelId, VecDeque<Message>>>>;
+    // type Value = Arc<RwLock<HashMap<ChannelId, WeedTimeMessage>>>;
+    type Value = Arc<DashMap<ChannelId, WeedTimeMessage>>;
 }
 
-struct Handler {
-    is_loop_running: AtomicBool,
-}
+struct Handler;
 
 #[async_trait]
 impl EventHandler for Handler {
+    // We use the cache_ready event just in case some cache operation is required in whatever use
+    // case you have for this.
+    async fn cache_ready(&self, _ctx: Context, _guilds: Vec<GuildId>) {
+        info!("Cache built successfully!");
+    }
+
     async fn message(&self, ctx: Context, msg: Message) {
+        let ctx = Arc::new(ctx);
+        let msg = Arc::new(msg);
+
+        let timestamp = msg.timestamp;
+
+        // let is_weed_time = timestamp.hour() % 12 == 4 && timestamp.minute() == 20;
+        let is_weed_time = true;
+        let contains_weed_time = msg.content.to_lowercase().contains("weed time");
+
         // We are verifying if the bot id is the same as the message author id.
-        if msg.author.id != ctx.cache.current_user_id() {
-            let channel_id = match msg.channel(&ctx.http).await {
+        // Also return if it's not 4:20 AND the message does not contain "weed time"
+        if msg.author.id == ctx.cache.current_user_id() || (!is_weed_time && !contains_weed_time) {
+            return;
+        }
+
+        let ctx1 = ctx.clone();
+        let msg1 = msg.clone();
+
+        tokio::spawn(async move {
+            let channel_id = match msg1.channel(&ctx1.http).await {
                 Ok(channel) => channel.id(),
                 Err(_) => return,
             };
             // Since data is located in Context, this means you are also able to use it within events!
-            let raw_messages = {
-                let data_read = ctx.data.read().await;
-                data_read
-                    .get::<MessageCount>()
-                    .expect("Expected MessageCount in TypeMap.")
-                    .clone()
-            };
 
-            let mut messages = raw_messages.write().await;
+            // let mut messages = raw_messages.write().await;
 
-            // Here, we are checking how many "owo" there are in the message content.
-            // let owo_in_msg = msg.content.to_ascii_lowercase().matches("owo").count();
+            // fn has_unique_elements<T>(iter: T) -> bool
+            // where
+            //     T: IntoIterator,
+            //     T::Item: Eq + Hash,
+            // {
+            //     let mut uniq = HashSet::new();
+            //     iter.into_iter().all(move |x| uniq.insert(x))
+            // }
 
-            // Atomic operations with ordering do not require mut to be modified.
-            // In this case, we want to increase the message count by 1.
-            // https://doc.rust-lang.org/std/sync/atomic/struct.AtomicUsize.html#method.fetch_add
-            // count.fetch_add(owo_in_msg, Ordering::SeqCst);
+            //               │ Type Weed Time  │ Else
+            // ──────────────┼─────────────────┼─────────────
+            //  Is Weed Time │ Increment Chain │ Break Chain
+            // ──────────────┼─────────────────┼─────────────
+            //  Else         │ Weed Crime      │ Nothing
 
-            fn has_unique_elements<T>(iter: T) -> bool
-            where
-                T: IntoIterator,
-                T::Item: Eq + Hash,
-            {
-                let mut uniq = HashSet::new();
-                iter.into_iter().all(move |x| uniq.insert(x))
+            // If the time is not 4:20 and the user wrote "weed time", reply with WEED CRIME
+            if !is_weed_time && contains_weed_time {
+                if let Err(why) = channel_id
+                    .send_files(&ctx1.http, vec!["420_jail.jpg"], |m| {
+                        m.content("WEED CRIME!")
+                    })
+                    .await
+                {
+                    error!("Error sending weed crime message: {why:?}");
+                }
+                return;
             }
 
-            match messages.get_mut(&channel_id) {
-                Some(messages) => {
-                    messages.push_back(msg);
-                    if messages.len() > 3 {
-                        messages.pop_front();
-                    }
-                    if messages.len() == 3
-                        && messages
-                            .make_contiguous()
-                            .windows(2)
-                            .all(|w| w[0].content_safe(&ctx) == w[1].content_safe(&ctx))
-                        && has_unique_elements(
-                            messages
-                                .make_contiguous()
-                                .into_iter()
-                                .map(|f| f.author.id)
-                                .collect::<Vec<_>>(),
-                        )
-                    {
-                        let content = messages.get(0).unwrap().content_safe(&ctx);
-                        if let Err(why) = channel_id.say(&ctx.http, &content).await {
-                            error!("Error saying '{}' in channel: {why:?}", &content);
+            // It can now be assumed that it is 4:20
+            loop {
+                let messages = {
+                    let data_read = ctx1.data.read().await;
+                    data_read
+                        .get::<MessageCount>()
+                        .expect("Expected MessageCount in TypeMap.")
+                        .clone()
+                };
+
+                match messages.try_get_mut(&channel_id) {
+                    TryResult::Present(mut weed_time_message) => {
+                        // Channel is present in map
+                        if timestamp.date_naive() == weed_time_message.msg.timestamp.date_naive()
+                            && timestamp.hour() == weed_time_message.msg.timestamp.hour()
+                            && contains_weed_time
+                        {
+                            let count = weed_time_message.count;
+                            let attachments = weed_time_message
+                                .msg
+                                .attachments
+                                .iter()
+                                .map(|a| a.id)
+                                .collect::<Vec<_>>();
+                            // If count is 0, the previous message was not "weed time"
+                            if count != 0 {
+                                if let Err(why) = weed_time_message
+                                    .msg
+                                    .edit(&ctx1.http, |m| {
+                                        m.content(format!("Weed time x{}", count));
+                                        for attachment in attachments {
+                                            m.remove_existing_attachment(attachment);
+                                        }
+                                        m
+                                    })
+                                    .await
+                                {
+                                    error!("Error editing message: {why:?}");
+                                }
+                            }
+                        } else {
+                            weed_time_message.users = Vec::new();
+                            weed_time_message.count = 0;
+                            if !contains_weed_time {
+                                break;
+                            }
                         }
+                        weed_time_message.users.push(msg1.author.id);
+                        weed_time_message.count += 1;
 
-                        messages.clear();
+                        weed_time_message.msg = channel_id
+                            .send_files(&ctx1.http, vec!["420.png"], |m| {
+                                m.content(format!("{}", weed_time_message.count))
+                            })
+                            .await
+                            .unwrap();
+                        println!("Message edited");
+                        break;
                     }
-                }
-                None => {
-                    messages.insert(channel_id, vec![msg].into());
-                }
+                    TryResult::Absent => {
+                        if contains_weed_time {
+                            messages.insert(
+                                channel_id,
+                                WeedTimeMessage {
+                                    msg: channel_id
+                                        .send_files(&ctx1.http, vec!["420.png"], |m| m.content("1"))
+                                        .await
+                                        .unwrap(),
+                                    users: vec![msg1.author.id],
+                                    count: 1,
+                                },
+                            );
+                            println!("Message inserted");
+                        }
+                        break;
+                    }
+                    TryResult::Locked => (), // Loop again and test if map is unlocked
+                };
             }
-        }
+        });
     }
 
     async fn ready(&self, _ctx: Context, ready: Ready) {
         info!("{} is connected!", ready.user.name);
     }
-
-    // We use the cache_ready event just in case some cache operation is required in whatever use
-    // case you have for this.
-    async fn cache_ready(&self, ctx: Context, _guilds: Vec<GuildId>) {
-        info!("Cache built successfully!");
-
-        // it's safe to clone Context, but Arc is cheaper for this use case.
-        // Untested claim, just theoretically. :P
-        let ctx = Arc::new(ctx);
-
-        // We need to check that the loop is not already running when this event triggers,
-        // as this event triggers every time the bot enters or leaves a guild, along every time the
-        // ready shard event triggers.
-        //
-        // An AtomicBool is used because it doesn't require a mutable reference to be changed, as
-        // we don't have one due to self being an immutable reference.
-        if !self.is_loop_running.load(Ordering::Relaxed) {
-            // We have to clone the Arc, as it gets moved into the new thread.
-            let ctx1 = Arc::clone(&ctx);
-            // tokio::spawn creates a new green thread that can run in parallel with the rest of
-            // the application.
-            tokio::spawn(async move {
-                loop {
-                    // We clone Context again here, because Arc is owned, so it moves to the
-                    // new function.
-                    log_system_load(Arc::clone(&ctx1)).await;
-                    tokio::time::sleep(Duration::from_secs(120)).await;
-                }
-            });
-
-            // And of course, we can run more than one thread at different timings.
-            let ctx2 = Arc::clone(&ctx);
-            tokio::spawn(async move {
-                loop {
-                    set_status_to_current_time(Arc::clone(&ctx2)).await;
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                }
-            });
-
-            // Now that the loop is running, we set the bool to true
-            self.is_loop_running.swap(true, Ordering::Relaxed);
-        }
-    }
-}
-
-async fn log_system_load(ctx: Arc<Context>) {
-    let cpu_load = sys_info::loadavg().unwrap();
-    let mem_use = sys_info::mem_info().unwrap();
-
-    // We can use ChannelId directly to send a message to a specific channel; in this case, the
-    // message would be sent to the #testing channel on the discord server.
-    let message = ChannelId(381926291785383946)
-        .send_message(&ctx, |m| {
-            m.embed(|e| {
-                e.title("System Resource Load")
-                    .field(
-                        "CPU Load Average",
-                        format!("{:.2}%", cpu_load.one * 10.0),
-                        false,
-                    )
-                    .field(
-                        "Memory Usage",
-                        format!(
-                            "{:.2} MB Free out of {:.2} MB",
-                            mem_use.free as f32 / 1000.0,
-                            mem_use.total as f32 / 1000.0
-                        ),
-                        false,
-                    )
-            })
-        })
-        .await;
-    if let Err(why) = message {
-        error!("Error sending message: {:?}", why);
-    };
-}
-
-async fn set_status_to_current_time(ctx: Arc<Context>) {
-    let current_time = Utc::now();
-    let formatted_time = current_time.to_rfc2822();
-
-    ctx.set_activity(Activity::playing(&formatted_time)).await;
 }
 
 #[group]
@@ -255,16 +247,14 @@ async fn main() {
         | GatewayIntents::MESSAGE_CONTENT;
     let mut client = Client::builder(&token, intents)
         .framework(framework)
-        .event_handler(Handler {
-            is_loop_running: AtomicBool::new(false),
-        })
+        .event_handler(Handler)
         .await
         .expect("Err creating client");
 
     {
         let mut data = client.data.write().await;
         data.insert::<ShardManagerContainer>(client.shard_manager.clone());
-        data.insert::<MessageCount>(Arc::new(RwLock::new(HashMap::new())));
+        data.insert::<MessageCount>(Arc::new(DashMap::new()));
     }
 
     let shard_manager = client.shard_manager.clone();
