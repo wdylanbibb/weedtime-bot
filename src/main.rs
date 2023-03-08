@@ -1,5 +1,3 @@
-mod commands;
-
 use std::{collections::HashSet, env, sync::Arc};
 
 use chrono::Timelike;
@@ -7,7 +5,7 @@ use dashmap::{try_result::TryResult, DashMap};
 use serenity::{
     async_trait,
     client::bridge::gateway::ShardManager,
-    framework::{standard::macros::group, StandardFramework},
+    framework::StandardFramework,
     http::Http,
     model::{
         gateway::Ready,
@@ -16,13 +14,6 @@ use serenity::{
     prelude::*,
 };
 use tracing::{error, info};
-
-use crate::commands::ping::*;
-
-// Weed time bot
-// to do:
-//  - During 4:20, keep track of all messages, and if one of them contains "weed time", reply to
-//  that message w/ an image, and keep track of successive "weed time" messages
 
 pub struct ShardManagerContainer;
 
@@ -49,7 +40,6 @@ impl TypeMapKey for MessageCount {
     //
     // Arc should stay, to allow for the data lock to be closed early.
     // type Value = Arc<AtomicUsize>;
-    // type Value = Arc<RwLock<HashMap<ChannelId, WeedTimeMessage>>>;
     type Value = Arc<DashMap<ChannelId, WeedTimeMessage>>;
 }
 
@@ -91,20 +81,14 @@ impl EventHandler for Handler {
 
             // let mut messages = raw_messages.write().await;
 
-            // fn has_unique_elements<T>(iter: T) -> bool
-            // where
-            //     T: IntoIterator,
-            //     T::Item: Eq + Hash,
-            // {
-            //     let mut uniq = HashSet::new();
-            //     iter.into_iter().all(move |x| uniq.insert(x))
-            // }
-
-            //               │ Type Weed Time  │ Else
-            // ──────────────┼─────────────────┼─────────────
-            //  Is Weed Time │ Increment Chain │ Break Chain
-            // ──────────────┼─────────────────┼─────────────
-            //  Else         │ Weed Crime      │ Nothing
+            fn has_unique_elements<T>(iter: T) -> bool
+            where
+                T: IntoIterator,
+                T::Item: Eq + std::hash::Hash,
+            {
+                let mut uniq = HashSet::new();
+                iter.into_iter().all(move |x| uniq.insert(x))
+            }
 
             // If the time is not 4:20 and the user wrote "weed time", reply with WEED CRIME
             if !is_weed_time && contains_weed_time {
@@ -136,6 +120,8 @@ impl EventHandler for Handler {
                             && timestamp.hour() == weed_time_message.msg.timestamp.hour()
                             && contains_weed_time
                         {
+                            // It is the same weed time as in the last message sent to the channel
+                            // and the message contains weed time (doesn't break combo)
                             let count = weed_time_message.count;
                             let attachments = weed_time_message
                                 .msg
@@ -157,9 +143,11 @@ impl EventHandler for Handler {
                                     .await
                                 {
                                     error!("Error editing message: {why:?}");
+                                    break;
                                 }
                             }
                         } else {
+                            // C-c-c-combo breaker!!
                             weed_time_message.users = Vec::new();
                             weed_time_message.count = 0;
                             if !contains_weed_time {
@@ -169,29 +157,43 @@ impl EventHandler for Handler {
                         weed_time_message.users.push(msg1.author.id);
                         weed_time_message.count += 1;
 
-                        weed_time_message.msg = channel_id
+                        match channel_id
                             .send_files(&ctx1.http, vec!["420.png"], |m| {
-                                m.content(format!("{}", weed_time_message.count))
+                                if weed_time_message.count > 1 {
+                                    m.content(format!("{}", weed_time_message.count));
+                                }
+                                m
                             })
                             .await
-                            .unwrap();
-                        println!("Message edited");
+                        {
+                            Ok(msg) => weed_time_message.msg = msg,
+                            Err(e) => {
+                                error!("Error editing message: {e:?}");
+                                break;
+                            }
+                        }
                         break;
                     }
                     TryResult::Absent => {
+                        // Channel has not send a weed time message
                         if contains_weed_time {
                             messages.insert(
                                 channel_id,
                                 WeedTimeMessage {
-                                    msg: channel_id
-                                        .send_files(&ctx1.http, vec!["420.png"], |m| m.content("1"))
+                                    msg: match channel_id
+                                        .send_files(&ctx1.http, vec!["420.png"], |m| m)
                                         .await
-                                        .unwrap(),
+                                    {
+                                        Ok(msg) => msg,
+                                        Err(e) => {
+                                            error!("Error sending message: {e:?}");
+                                            break;
+                                        }
+                                    },
                                     users: vec![msg1.author.id],
                                     count: 1,
                                 },
                             );
-                            println!("Message inserted");
                         }
                         break;
                     }
@@ -205,10 +207,6 @@ impl EventHandler for Handler {
         info!("{} is connected!", ready.user.name);
     }
 }
-
-#[group]
-#[commands(ping)]
-struct General;
 
 #[tokio::main]
 async fn main() {
@@ -238,9 +236,7 @@ async fn main() {
     };
 
     // Create the framework
-    let framework = StandardFramework::new()
-        .configure(|c| c.owners(owners).prefix("~"))
-        .group(&GENERAL_GROUP);
+    let framework = StandardFramework::new().configure(|c| c.owners(owners).prefix("~"));
 
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
