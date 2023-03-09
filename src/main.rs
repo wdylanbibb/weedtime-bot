@@ -1,15 +1,11 @@
+mod commands;
+mod db;
+
 use std::{collections::HashSet, env, sync::Arc};
 
-use bonsaidb::{
-    core::schema::{Collection, Schema, SerializedCollection},
-    local::{
-        config::{Builder, StorageConfiguration},
-        AsyncDatabase,
-    },
-};
+use bonsaidb::core::schema::SerializedCollection;
 use chrono::Timelike;
 use dashmap::{try_result::TryResult, DashMap};
-use serde::{Deserialize, Serialize};
 use serenity::{
     async_trait,
     client::bridge::gateway::ShardManager,
@@ -22,6 +18,8 @@ use serenity::{
     prelude::*,
 };
 use tracing::{error, info};
+
+use db::*;
 
 pub struct ShardManagerContainer;
 
@@ -37,31 +35,6 @@ struct WeedTimeMessage {
     users: Vec<UserId>,
     // The number of successive weed time messages
     count: u32,
-}
-
-#[derive(Debug, Schema)]
-#[schema(name = "WeedTimeSchema", collections = [GuildStats, UserStats])]
-struct WeedTimeSchema;
-
-#[derive(Debug, Serialize, Deserialize, Default, Collection, PartialEq, Eq, PartialOrd, Ord)]
-#[collection(name = "GuildStats")]
-#[collection(natural_id = |stats: &Self| Some(stats.guild.into()))]
-struct GuildStats {
-    guild: GuildId,
-    total_weed_times: u32,
-    total_weed_crimes: u32,
-    longest_chain: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default, Collection, PartialEq, Eq, PartialOrd, Ord)]
-#[collection(name = "UserStats")]
-#[collection(natural_id = |stats: &Self| Some(stats.user.into()))]
-struct UserStats {
-    user: UserId,
-    total_weed_times: u32,
-    total_weed_crimes: u32,
-    chains_started: u32,
-    chains_broken: u32,
 }
 
 fn combo_to_emojis(combo: u32) -> String {
@@ -134,10 +107,7 @@ impl EventHandler for Handler {
         let msg1 = msg.clone();
 
         tokio::spawn(async move {
-            let db =
-                AsyncDatabase::open::<WeedTimeSchema>(StorageConfiguration::new("basic.bonsaidb"))
-                    .await
-                    .expect("Error opening database");
+            let db = db::open().await.expect("Error opening database");
 
             let channel_id = match msg1.channel(&ctx1.http).await {
                 Ok(channel) => channel.id(),
@@ -158,13 +128,50 @@ impl EventHandler for Handler {
 
             // If the time is not 4:20 and the user wrote "weed time", reply with WEED CRIME
             if !is_weed_time && contains_weed_time {
-                if let Err(why) = channel_id
+                // if let Err(why) = channel_id
+                //     .send_files(&ctx1.http, vec!["420_jail.jpg"], |m| {
+                //         m.content("WEED CRIME!")
+                //     })
+                //     .await
+                // {
+                //     error!("Error sending weed crime message: {why:?}");
+                // }
+                match channel_id
                     .send_files(&ctx1.http, vec!["420_jail.jpg"], |m| {
                         m.content("WEED CRIME!")
                     })
                     .await
                 {
-                    error!("Error sending weed crime message: {why:?}");
+                    Ok(_) => {
+                        if let Some(guild_id) = msg1.guild_id {
+                            match GuildStats::get_async::<_, u64>(guild_id.into(), &db).await {
+                                Ok(doc) => match doc {
+                                    Some(mut doc) => {
+                                        doc.contents.total_weed_crimes += 1;
+                                        if let Err(why) = doc.update_async(&db).await {
+                                            error!("Error updating doc: {why:?}");
+                                        }
+                                    }
+                                    None => {
+                                        if let Err(e) = GuildStats::push_async(
+                                            GuildStats {
+                                                guild: guild_id,
+                                                total_weed_crimes: 1,
+                                                ..Default::default()
+                                            },
+                                            &db,
+                                        )
+                                        .await
+                                        {
+                                            error!("Error pushing guild into db: {e:?}");
+                                        }
+                                    }
+                                },
+                                Err(e) => error!("Error getting doc from db: {e:?}"),
+                            }
+                        }
+                    }
+                    Err(e) => error!("Error sending weed crime message: {e:?}"),
                 }
                 return;
             }
@@ -242,7 +249,46 @@ impl EventHandler for Handler {
                             })
                             .await
                         {
-                            Ok(msg) => weed_time_message.msg = msg,
+                            Ok(msg) => {
+                                if let Some(guild_id) = msg1.guild_id {
+                                    match GuildStats::get_async(&guild_id.into(), &db).await {
+                                        Ok(guild) => match guild {
+                                            Some(mut doc) => {
+                                                doc.contents.total_weed_times += 1;
+                                                if weed_time_message.count
+                                                    > doc.contents.longest_chain
+                                                {
+                                                    doc.contents.longest_chain =
+                                                        weed_time_message.count;
+                                                }
+                                                if let Err(e) = doc.update_async(&db).await {
+                                                    error!("Error updating doc: {e:?}");
+                                                    break;
+                                                }
+                                            }
+                                            None => {
+                                                let stats = GuildStats {
+                                                    guild: guild_id,
+                                                    total_weed_times: weed_time_message.count,
+                                                    total_weed_crimes: 0,
+                                                    longest_chain: weed_time_message.count,
+                                                };
+                                                if let Err(e) =
+                                                    GuildStats::push_async(stats, &db).await
+                                                {
+                                                    error!("Error pushing into database: {e:?}");
+                                                    break;
+                                                }
+                                            }
+                                        },
+                                        Err(e) => {
+                                            error!("Error getting doc from db: {e:?}");
+                                            break;
+                                        }
+                                    }
+                                }
+                                weed_time_message.msg = msg;
+                            }
                             Err(e) => {
                                 error!("Error sending message: {e:?}");
                                 break;
@@ -251,16 +297,58 @@ impl EventHandler for Handler {
                         break;
                     }
                     TryResult::Absent => {
-                        // Channel has not send a weed time message
+                        // Channel has not sent a weed time message
                         if contains_weed_time {
                             messages.insert(
                                 channel_id,
                                 WeedTimeMessage {
-                                    msg: match channel_id
-                                        .send_files(&ctx1.http, vec!["420.png"], |m| m)
-                                        .await
-                                    {
-                                        Ok(msg) => msg,
+                                    msg: match channel_id .send_files(&ctx1.http, vec!["420.png"], |m| m) .await {
+                                        Ok(msg) => {
+                                            if let Some(guild_id) = msg1.guild_id {
+                                                match GuildStats::get_async(&guild_id.into(), &db) .await {
+                                                    Ok(guild) => match guild {
+                                                        Some(mut doc) => {
+                                                            // Increment "weed time" count
+                                                            doc.contents.total_weed_times += 1;
+                                                            // Check if 1 is greater than
+                                                            // longest_chain (only possible
+                                                            // if the server had nothing
+                                                            // but weed crimes)
+                                                            if 1 > doc.contents.longest_chain {
+                                                                doc.contents.longest_chain = 1;
+                                                            }
+                                                            match doc.update_async(&db).await {
+                                                                Ok(()) => (),
+                                                                Err(e) => {
+                                                                    error!("Error updating database: {e:?}");
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                        None => {
+                                                            let stats = GuildStats {
+                                                                guild: guild_id,
+                                                                total_weed_times: 1,
+                                                                total_weed_crimes: 0,
+                                                                longest_chain: 1
+                                                            };
+                                                            match GuildStats::push_async(stats, &db).await {
+                                                                Ok(_) => (),
+                                                                Err(e) => {
+                                                                    error!("Error pushing into database: {e:?}");
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    Err(e) => {
+                                                        error!("Error accessing database: {e:?}");
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            msg
+                                        }
                                         Err(e) => {
                                             error!("Error sending message: {e:?}");
                                             break;
@@ -270,12 +358,6 @@ impl EventHandler for Handler {
                                     count: 1,
                                 },
                             );
-                        }
-                        if let Some(guild_id) = msg1.guild_id {
-                            match GuildStats::get_async(&guild_id.into(), &db).await {
-                                Ok(g) => println!("{g:?}"),
-                                Err(e) => error!("{e:?}"),
-                            }
                         }
                         break;
                     }
