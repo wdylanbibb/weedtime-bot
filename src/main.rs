@@ -1,7 +1,15 @@
 use std::{collections::HashSet, env, sync::Arc};
 
+use bonsaidb::{
+    core::schema::{Collection, Schema, SerializedCollection},
+    local::{
+        config::{Builder, StorageConfiguration},
+        AsyncDatabase,
+    },
+};
 use chrono::Timelike;
 use dashmap::{try_result::TryResult, DashMap};
+use serde::{Deserialize, Serialize};
 use serenity::{
     async_trait,
     client::bridge::gateway::ShardManager,
@@ -29,6 +37,59 @@ struct WeedTimeMessage {
     users: Vec<UserId>,
     // The number of successive weed time messages
     count: u32,
+}
+
+#[derive(Debug, Schema)]
+#[schema(name = "WeedTimeSchema", collections = [GuildStats, UserStats])]
+struct WeedTimeSchema;
+
+#[derive(Debug, Serialize, Deserialize, Default, Collection, PartialEq, Eq, PartialOrd, Ord)]
+#[collection(name = "GuildStats")]
+#[collection(natural_id = |stats: &Self| Some(stats.guild.into()))]
+struct GuildStats {
+    guild: GuildId,
+    total_weed_times: u32,
+    total_weed_crimes: u32,
+    longest_chain: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Collection, PartialEq, Eq, PartialOrd, Ord)]
+#[collection(name = "UserStats")]
+#[collection(natural_id = |stats: &Self| Some(stats.user.into()))]
+struct UserStats {
+    user: UserId,
+    total_weed_times: u32,
+    total_weed_crimes: u32,
+    chains_started: u32,
+    chains_broken: u32,
+}
+
+fn combo_to_emojis(combo: u32) -> String {
+    // Get the amount of times a number can be divided by 10 without going under 10
+    let count = std::iter::successors(Some(combo), |&n| (n >= 10).then(|| n / 10)).count();
+    // Nums is an array of single digit numbers that make up the combo amount
+    let nums = (0..count as u32)
+        .into_iter()
+        .map(|n| combo / 10_u32.pow(n) % 10)
+        .collect::<Vec<_>>();
+    // Match each number with the emoji ('x' if is none (somehow))
+    let mut str = "".to_owned();
+    for n in nums {
+        str.push_str(match n {
+            0 => "<:combo0:1083097710112022739>",
+            1 => "<:combo1:1083097662624112753>",
+            2 => "<:combo2:1083097661814620302>",
+            3 => "<:combo3:1083097660669567037>",
+            4 => "<:combo4:1083097659360944168>",
+            5 => "<:combo5:1083097655854510161>",
+            6 => "<:combo6:1083097654927564830>",
+            7 => "<:combo7:1083097653363101697>",
+            8 => "<:combo8:1083097652834615356>",
+            9 => "<:combo9:1083097651232374784>",
+            _ => "<:x_:1083098032268120075>",
+        })
+    }
+    str.to_string()
 }
 
 struct MessageCount;
@@ -73,6 +134,11 @@ impl EventHandler for Handler {
         let msg1 = msg.clone();
 
         tokio::spawn(async move {
+            let db =
+                AsyncDatabase::open::<WeedTimeSchema>(StorageConfiguration::new("basic.bonsaidb"))
+                    .await
+                    .expect("Error opening database");
+
             let channel_id = match msg1.channel(&ctx1.http).await {
                 Ok(channel) => channel.id(),
                 Err(_) => return,
@@ -116,9 +182,15 @@ impl EventHandler for Handler {
                 match messages.try_get_mut(&channel_id) {
                     TryResult::Present(mut weed_time_message) => {
                         // Channel is present in map
+                        weed_time_message.users.push(msg1.author.id);
+
+                        // let has_unique_users = has_unique_elements(weed_time_message.users.iter());
+                        let has_unique_users = true;
+
                         if timestamp.date_naive() == weed_time_message.msg.timestamp.date_naive()
                             && timestamp.hour() == weed_time_message.msg.timestamp.hour()
                             && contains_weed_time
+                            && has_unique_users
                         {
                             // It is the same weed time as in the last message sent to the channel
                             // and the message contains weed time (doesn't break combo)
@@ -134,7 +206,11 @@ impl EventHandler for Handler {
                                 if let Err(why) = weed_time_message
                                     .msg
                                     .edit(&ctx1.http, |m| {
-                                        m.content(format!("Weed time x{}", count));
+                                        combo_to_emojis(count);
+                                        m.content(format!(
+                                            "<:4_:1083068784404865136><:2_:1083068782764900412><:0_:1083068785436672010> <:x_:1083098032268120075>{}",
+                                            combo_to_emojis(count)
+                                        ));
                                         for attachment in attachments {
                                             m.remove_existing_attachment(attachment);
                                         }
@@ -154,7 +230,7 @@ impl EventHandler for Handler {
                                 break;
                             }
                         }
-                        weed_time_message.users.push(msg1.author.id);
+
                         weed_time_message.count += 1;
 
                         match channel_id
@@ -168,7 +244,7 @@ impl EventHandler for Handler {
                         {
                             Ok(msg) => weed_time_message.msg = msg,
                             Err(e) => {
-                                error!("Error editing message: {e:?}");
+                                error!("Error sending message: {e:?}");
                                 break;
                             }
                         }
@@ -194,6 +270,12 @@ impl EventHandler for Handler {
                                     count: 1,
                                 },
                             );
+                        }
+                        if let Some(guild_id) = msg1.guild_id {
+                            match GuildStats::get_async(&guild_id.into(), &db).await {
+                                Ok(g) => println!("{g:?}"),
+                                Err(e) => error!("{e:?}"),
+                            }
                         }
                         break;
                     }
