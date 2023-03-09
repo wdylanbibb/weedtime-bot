@@ -137,7 +137,7 @@ impl EventHandler for Handler {
                 //     error!("Error sending weed crime message: {why:?}");
                 // }
                 match channel_id
-                    .send_files(&ctx1.http, vec!["420_jail.jpg"], |m| {
+                    .send_files(&ctx1.http, vec!["assets/420_jail.jpg"], |m| {
                         m.content("WEED CRIME!")
                     })
                     .await
@@ -241,7 +241,7 @@ impl EventHandler for Handler {
                         weed_time_message.count += 1;
 
                         match channel_id
-                            .send_files(&ctx1.http, vec!["420.png"], |m| {
+                            .send_files(&ctx1.http, vec!["assets/420.png"], |m| {
                                 if weed_time_message.count > 1 {
                                     m.content(format!("{}", weed_time_message.count));
                                 }
@@ -302,7 +302,7 @@ impl EventHandler for Handler {
                             messages.insert(
                                 channel_id,
                                 WeedTimeMessage {
-                                    msg: match channel_id .send_files(&ctx1.http, vec!["420.png"], |m| m) .await {
+                                    msg: match channel_id .send_files(&ctx1.http, vec!["assets/420.png"], |m| m) .await {
                                         Ok(msg) => {
                                             if let Some(guild_id) = msg1.guild_id {
                                                 match GuildStats::get_async(&guild_id.into(), &db) .await {
