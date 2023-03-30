@@ -164,8 +164,8 @@ impl EventHandler for Handler {
                         // Channel is present in map
                         weed_time_message.users.push(msg1.author.id);
 
-                        // let has_unique_users = has_unique_elements(weed_time_message.users.iter());
-                        let has_unique_users = true;
+                        let has_unique_users = has_unique_elements(weed_time_message.users.iter());
+                        // let has_unique_users = true;
 
                         if timestamp.date_naive() == weed_time_message.msg.timestamp.date_naive()
                             && timestamp.hour() == weed_time_message.msg.timestamp.hour()
