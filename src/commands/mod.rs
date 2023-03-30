@@ -1,1 +1,2 @@
-pub mod stats;
+pub mod serverstats;
+pub mod userstats;
