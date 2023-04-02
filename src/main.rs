@@ -336,15 +336,15 @@ impl EventHandler for Handler {
         info!("{} is connected!", ready.user.name);
 
         if let Ok(guild_id) = env::var("GUILD_ID") {
-            let guild_id = GuildId(guild_id.parse().expect("GUILD_ID must be an integer"));
+            let _guild_id = GuildId(guild_id.parse().expect("GUILD_ID must be an integer"));
+        }
 
-            if let Err(e) = GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
-                commands.create_application_command(|command| commands::timezone::register(command))
-            })
-            .await
-            {
-                error!("Error creating slash commands: {e:?}");
-            }
+        if let Err(e) = Command::create_global_application_command(&ctx.http, |command| {
+            commands::timezone::register(command)
+        })
+        .await
+        {
+            error!("Error creating slash command: {e:?}");
         }
 
         if let Err(e) = Command::create_global_application_command(&ctx.http, |command| {
