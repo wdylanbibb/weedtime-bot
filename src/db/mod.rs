@@ -20,6 +20,7 @@ pub struct WeedTimeSchema;
 #[collection(natural_id = |stats: &Self| Some(stats.guild.into()))]
 pub struct GuildStats {
     pub guild: GuildId,
+    pub utc_offset: i32,
     pub total_weed_times: u32,
     pub total_weed_crimes: u32,
     pub longest_chain: u32,

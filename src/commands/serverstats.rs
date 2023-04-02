@@ -33,6 +33,7 @@ pub async fn run(
         total_weed_times,
         total_weed_crimes,
         longest_chain,
+        ..
     } = match GuildStats::get_async::<_, u64>(guild_id.into(), &db).await {
         Ok(doc) => match doc {
             Some(doc) => doc.contents,

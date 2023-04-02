@@ -3,7 +3,8 @@ mod db;
 
 use std::{collections::HashSet, env, sync::Arc};
 
-use chrono::Timelike;
+use bonsaidb::core::schema::SerializedCollection;
+use chrono::{DateTime, FixedOffset, TimeZone, Timelike};
 use dashmap::{try_result::TryResult, DashMap};
 use serenity::{
     async_trait,
@@ -90,25 +91,44 @@ impl EventHandler for Handler {
         let ctx = Arc::new(ctx);
         let msg = Arc::new(msg);
 
-        let timestamp = msg.timestamp;
-
-        let is_weed_time = timestamp.hour() % 12 == 4 && timestamp.minute() == 20;
-        // let is_weed_time = true;
-        let contains_weed_time = msg.content.to_lowercase().contains("weed time");
-
-        // We are verifying if the bot id is the same as the message author id.
-        // Also return if it's not 4:20 AND the message does not contain "weed time"
-        if msg.author.id == ctx.cache.current_user_id() || (!is_weed_time && !contains_weed_time) {
-            return;
-        }
-
-        let ctx1 = ctx.clone();
-        let msg1 = msg.clone();
-
         tokio::spawn(async move {
             let db = db::open().await.expect("Error opening database");
 
-            let channel_id = match msg1.channel(&ctx1.http).await {
+            let offset = match FixedOffset::east_opt({
+                match msg.guild_id {
+                    Some(id) => match db::GuildStats::get_async::<_, u64>(id.into(), &db).await {
+                        Ok(doc) => match doc {
+                            Some(doc) => doc.contents.utc_offset,
+                            None => 0,
+                        },
+                        Err(e) => {
+                            error!("Error opening guild in database: {e:?}");
+                            0
+                        }
+                    },
+                    None => 0,
+                }
+            }) {
+                Some(offset) => offset,
+                None => FixedOffset::east_opt(0).unwrap(),
+            };
+
+            let timestamp: DateTime<FixedOffset> =
+                msg.timestamp.with_timezone(&TimeZone::from_offset(&offset));
+
+            let is_weed_time = timestamp.hour() % 12 == 4 && timestamp.minute() == 20;
+            // let is_weed_time = true;
+            let contains_weed_time = msg.content.to_lowercase().contains("weed time");
+
+            // We are verifying if the bot id is the same as the message author id.
+            // Also return if it's not 4:20 AND the message does not contain "weed time"
+            if msg.author.id == ctx.cache.current_user_id()
+                || (!is_weed_time && !contains_weed_time)
+            {
+                return;
+            }
+
+            let channel_id = match msg.channel(&ctx.http).await {
                 Ok(channel) => channel.id(),
                 Err(_) => return,
             };
@@ -131,17 +151,17 @@ impl EventHandler for Handler {
                 // If the time is not 4:20 and the user wrote "weed time", reply with WEED CRIME
                 if !is_weed_time && contains_weed_time {
                     match channel_id
-                        .send_files(&ctx1.http, vec!["assets/420_jail.jpg"], |m| {
+                        .send_files(&ctx.http, vec!["assets/420_jail.jpg"], |m| {
                             m.content("WEED CRIME!")
                         })
                         .await
                     {
                         Ok(_) => {
                             // WEED CRIME EVENT
-                            if let Some(guild_id) = msg1.guild_id {
+                            if let Some(guild_id) = msg.guild_id {
                                 event = Some(db::WeedTimeEvent::WeedCrime(db::EventData {
                                     guild_id,
-                                    user_id: msg1.author.id,
+                                    user_id: msg.author.id,
                                 }));
                             }
                         }
@@ -152,7 +172,7 @@ impl EventHandler for Handler {
 
                 // It can now be assumed that it is 4:20
                 let messages = {
-                    let data_read = ctx1.data.read().await;
+                    let data_read = ctx.data.read().await;
                     data_read
                         .get::<MessageCount>()
                         .expect("Expected MessageCount in TypeMap.")
@@ -162,13 +182,16 @@ impl EventHandler for Handler {
                 match messages.try_get_mut(&channel_id) {
                     TryResult::Present(mut weed_time_message) => {
                         // Channel is present in map
-                        weed_time_message.users.push(msg1.author.id);
+                        weed_time_message.users.push(msg.author.id);
 
                         let has_unique_users = has_unique_elements(weed_time_message.users.iter());
                         // let has_unique_users = true;
 
-                        if timestamp.date_naive() == weed_time_message.msg.timestamp.date_naive()
-                            && timestamp.hour() == weed_time_message.msg.timestamp.hour()
+                        let weed_time_timestamp: DateTime<FixedOffset> =
+                            msg.timestamp.with_timezone(&TimeZone::from_offset(&offset));
+
+                        if timestamp.date_naive() == weed_time_timestamp.date_naive()
+                            && timestamp.hour() == weed_time_timestamp.hour()
                             && contains_weed_time
                             && has_unique_users
                         {
@@ -185,7 +208,7 @@ impl EventHandler for Handler {
                             if count != 0 {
                                 if let Err(why) = weed_time_message
                                     .msg
-                                    .edit(&ctx1.http, |m| {
+                                    .edit(&ctx.http, |m| {
                                         combo_to_emojis(count);
                                         m.content(format!(
                                             "<:4_:1083068784404865136><:2_:1083068782764900412><:0_:1083068785436672010> <:x_:1083098032268120075>{}",
@@ -208,10 +231,10 @@ impl EventHandler for Handler {
                             weed_time_message.count = 0;
                             if !contains_weed_time {
                                 // CHAIN BROKEN EVENT
-                                if let Some(guild_id) = msg1.guild_id {
+                                if let Some(guild_id) = msg.guild_id {
                                     event = Some(db::WeedTimeEvent::ChainBroken(db::EventData {
                                         guild_id,
-                                        user_id: msg1.author.id,
+                                        user_id: msg.author.id,
                                     }));
                                 }
                                 break;
@@ -221,7 +244,7 @@ impl EventHandler for Handler {
                         weed_time_message.count += 1;
 
                         match channel_id
-                            .send_files(&ctx1.http, vec!["assets/420.png"], |m| {
+                            .send_files(&ctx.http, vec!["assets/420.png"], |m| {
                                 if weed_time_message.count > 1 {
                                     m.content(format!(
                                         "<:x_:1083098032268120075>{}",
@@ -235,21 +258,21 @@ impl EventHandler for Handler {
                             Ok(msg) => {
                                 if weed_time_message.count > 1 {
                                     // WEED TIME EVENT
-                                    if let Some(guild_id) = msg1.guild_id {
+                                    if let Some(guild_id) = msg.guild_id {
                                         event = Some(db::WeedTimeEvent::WeedTime(
                                             weed_time_message.count,
                                             db::EventData {
                                                 guild_id,
-                                                user_id: msg1.author.id,
+                                                user_id: msg.author.id,
                                             },
                                         ));
                                     }
                                 } else {
                                     // NEW CHAIN EVENT
-                                    if let Some(guild_id) = msg1.guild_id {
+                                    if let Some(guild_id) = msg.guild_id {
                                         event = Some(db::WeedTimeEvent::NewChain(db::EventData {
                                             guild_id,
-                                            user_id: msg1.author.id,
+                                            user_id: msg.author.id,
                                         }));
                                     }
                                 }
@@ -269,17 +292,17 @@ impl EventHandler for Handler {
                                 channel_id,
                                 WeedTimeMessage {
                                     msg: match channel_id
-                                        .send_files(&ctx1.http, vec!["assets/420.png"], |m| m)
+                                        .send_files(&ctx.http, vec!["assets/420.png"], |m| m)
                                         .await
                                     {
                                         Ok(msg) => {
                                             // New weed time chain started
                                             // NEW CHAIN EVENT
-                                            if let Some(guild_id) = msg1.guild_id {
+                                            if let Some(guild_id) = msg.guild_id {
                                                 event = Some(db::WeedTimeEvent::NewChain(
                                                     db::EventData {
                                                         guild_id,
-                                                        user_id: msg1.author.id,
+                                                        user_id: msg.author.id,
                                                     },
                                                 ));
                                             }
@@ -290,7 +313,7 @@ impl EventHandler for Handler {
                                             break;
                                         }
                                     },
-                                    users: vec![msg1.author.id],
+                                    users: vec![msg.author.id],
                                     count: 1,
                                 },
                             );
@@ -312,30 +335,33 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!("{} is connected!", ready.user.name);
 
-        let guild_id = GuildId(
-            env::var("GUILD_ID")
-                .expect("Expected GUILD_ID in environment")
-                .parse()
-                .expect("GUILD_ID must be an integer"),
-        );
+        if let Ok(guild_id) = env::var("GUILD_ID") {
+            let guild_id = GuildId(guild_id.parse().expect("GUILD_ID must be an integer"));
 
-        // if let Err(e) = GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
-        //     commands
-        //         .create_application_command(|command| commands::serverstats::register(command))
-        //         .create_application_command(|command| commands::userstats::register(command))
-        // })
-        // .await
-        // {
-        //     error!("Error creating slash commands: {e:?}");
-        // }
+            if let Err(e) = GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
+                commands.create_application_command(|command| commands::timezone::register(command))
+            })
+            .await
+            {
+                error!("Error creating slash commands: {e:?}");
+            }
+        }
 
-        let _ = Command::create_global_application_command(&ctx.http, |command| {
+        if let Err(e) = Command::create_global_application_command(&ctx.http, |command| {
             commands::serverstats::register(command)
-        });
+        })
+        .await
+        {
+            error!("Error creating slash command: {e:?}");
+        }
 
-        let _ = Command::create_global_application_command(&ctx.http, |command| {
+        if let Err(e) = Command::create_global_application_command(&ctx.http, |command| {
             commands::userstats::register(command)
-        });
+        })
+        .await
+        {
+            error!("Error creating slash command: {e:?}");
+        }
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -345,6 +371,7 @@ impl EventHandler for Handler {
                 "userstats" => {
                     commands::userstats::run(&ctx, &command, &command.data.options).await
                 }
+                "timezone" => commands::timezone::run(&ctx, &command, &command.data.options).await,
                 _ => Ok(()),
             } {
                 error!("Error executing slash command: {e:?}");
