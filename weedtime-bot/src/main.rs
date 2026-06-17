@@ -5,8 +5,16 @@ use std::{env, error::Error, fs, path::Path, sync::Arc};
 use chrono_tz::Tz;
 use serenity::{
     Client,
-    all::{ChannelId, Context, CreateMessage, EventHandler, GatewayIntents, Message, UserId},
+    all::{
+        ChannelId, Command, CommandInteraction, CommandOptionType, Context, EventHandler,
+        GatewayIntents, Interaction, Message, Ready, ResolvedValue, User, UserId,
+    },
     async_trait,
+    builder::{
+        CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedAuthor,
+        CreateInteractionResponse, CreateInteractionResponseMessage,
+    },
+    model::colour::Colour,
     prelude::TypeMapKey,
 };
 use tracing::{error, warn};
@@ -81,79 +89,184 @@ fn open_or_create_databases() -> Result<WeedTimeDatabases, Box<dyn Error>> {
     ))
 }
 
-fn is_stats_command(content: &str) -> bool {
-    matches!(content.trim(), "!weedstats" | "!weed stats")
+fn stats_commands() -> Vec<CreateCommand> {
+    vec![
+        CreateCommand::new("userstats")
+            .description("Show weed stats for a user")
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::User,
+                "user",
+                "The user to show stats for",
+            )),
+        CreateCommand::new("serverstats").description("Show weed stats for this server"),
+    ]
 }
 
-fn format_user_stats(user_id: UserId, stats: Option<UserStats>) -> String {
-    match stats {
-        Some(stats) => format!(
-            "<@{}>\nWeed times: {}\nWeed crimes: {}\nChains started: {}\nChains broken: {}",
-            user_id.get(),
-            stats.weed_times,
-            stats.weed_crimes,
-            stats.chains_started,
-            stats.chains_broken
-        ),
-        None => format!("<@{}>\nNo weed stats yet.", user_id.get()),
+fn user_stats_embed(user: &User, stats: Option<UserStats>) -> CreateEmbed {
+    let embed = CreateEmbed::new()
+        .title(format!("{}'s Weed Stats", user.name))
+        .author(CreateEmbedAuthor::new(user.name.clone()).icon_url(user.face()))
+        .thumbnail(user.face())
+        .colour(Colour::DARK_GREEN);
+
+    if let Some(stats) = stats {
+        embed
+            .field("Weed times", stats.weed_times.to_string(), true)
+            .field("Weed crimes", stats.weed_crimes.to_string(), true)
+            .field("Chains started", stats.chains_started.to_string(), true)
+            .field("Chains broken", stats.chains_broken.to_string(), true)
+    } else {
+        embed.description("No weed stats yet.")
     }
 }
 
-fn format_guild_stats(stats: Option<GuildStats>) -> String {
-    match stats {
-        Some(stats) => format!(
-            "Server\nWeed times: {}\nWeed crimes: {}\nLongest chain: {}",
-            stats.weed_times, stats.weed_crimes, stats.longest_chain
-        ),
-        None => "Server\nNo weed stats yet.".to_string(),
+fn guild_stats_embed(
+    name: String,
+    icon_url: Option<String>,
+    stats: Option<GuildStats>,
+) -> CreateEmbed {
+    let mut author = CreateEmbedAuthor::new(name.clone());
+    if let Some(icon_url) = icon_url.clone() {
+        author = author.icon_url(icon_url);
+    }
+
+    let mut embed = CreateEmbed::new()
+        .title(format!("{name} Weed Stats"))
+        .author(author)
+        .colour(Colour::DARK_GREEN);
+
+    if let Some(icon_url) = icon_url {
+        embed = embed.thumbnail(icon_url);
+    }
+
+    if let Some(stats) = stats {
+        embed
+            .field("Weed times", stats.weed_times.to_string(), true)
+            .field("Weed crimes", stats.weed_crimes.to_string(), true)
+            .field("Longest chain", stats.longest_chain.to_string(), true)
+    } else {
+        embed.description("No weed stats yet.")
     }
 }
 
-async fn handle_stats_command(
+async fn respond_with_embed(
     ctx: &Context,
-    msg: &Message,
-    db: &WeedTimeDatabases,
-) -> Result<bool, serenity::Error> {
-    if !is_stats_command(&msg.content.to_lowercase()) {
-        return Ok(false);
-    }
+    command: &CommandInteraction,
+    embed: CreateEmbed,
+) -> Result<(), serenity::Error> {
+    command
+        .create_response(
+            ctx,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new().embed(embed),
+            ),
+        )
+        .await
+}
 
-    let user_id = msg
-        .mentions
-        .first()
-        .map(|user| user.id)
-        .unwrap_or(msg.author.id);
-    let user_stats = match db.0.get(user_id) {
+async fn respond_with_content(
+    ctx: &Context,
+    command: &CommandInteraction,
+    content: impl Into<String>,
+) -> Result<(), serenity::Error> {
+    command
+        .create_response(
+            ctx,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(content)
+                    .ephemeral(true),
+            ),
+        )
+        .await
+}
+
+async fn handle_user_stats_command(
+    ctx: &Context,
+    command: &CommandInteraction,
+    db: &WeedTimeDatabases,
+) -> Result<(), serenity::Error> {
+    let target = command
+        .data
+        .options()
+        .into_iter()
+        .find_map(|option| match option.value {
+            ResolvedValue::User(user, _) if option.name == "user" => Some(user.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| command.user.clone());
+
+    let stats = match db.0.get(target.id) {
         Ok(stats) => stats,
         Err(e) => {
-            error!("Failed to fetch user stats for {user_id}: {e:?}");
+            error!("Failed to fetch user stats for {}: {e:?}", target.id);
             None
         }
     };
 
-    let guild_stats = msg.guild_id.and_then(|guild_id| match db.1.get(guild_id) {
+    respond_with_embed(ctx, command, user_stats_embed(&target, stats)).await
+}
+
+async fn handle_guild_stats_command(
+    ctx: &Context,
+    command: &CommandInteraction,
+    db: &WeedTimeDatabases,
+) -> Result<(), serenity::Error> {
+    let Some(guild_id) = command.guild_id else {
+        return respond_with_content(ctx, command, "Server stats are only available in a server.")
+            .await;
+    };
+
+    let guild = guild_id.to_partial_guild(ctx).await?;
+    let stats = match db.1.get(guild_id) {
         Ok(stats) => stats,
         Err(e) => {
             error!("Failed to fetch guild stats for {guild_id}: {e:?}");
             None
         }
-    });
+    };
 
-    let mut response = format_user_stats(user_id, user_stats);
-    if msg.guild_id.is_some() {
-        response.push_str("\n\n");
-        response.push_str(&format_guild_stats(guild_stats));
+    let icon_url = guild.icon_url();
+    respond_with_embed(ctx, command, guild_stats_embed(guild.name, icon_url, stats)).await
+}
+
+async fn handle_stats_interaction(
+    ctx: &Context,
+    command: &CommandInteraction,
+    db: &WeedTimeDatabases,
+) -> Result<(), serenity::Error> {
+    match command.data.name.as_str() {
+        "userstats" => handle_user_stats_command(ctx, command, db).await,
+        "serverstats" => handle_guild_stats_command(ctx, command, db).await,
+        _ => Ok(()),
     }
-
-    msg.channel_id
-        .send_message(&ctx.http, CreateMessage::new().content(response))
-        .await?;
-
-    Ok(true)
 }
 
 #[async_trait]
 impl EventHandler for Handler {
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        match Command::set_global_commands(&ctx.http, stats_commands()).await {
+            Ok(commands) => {
+                tracing::info!(
+                    "Registered {} slash commands for {}",
+                    commands.len(),
+                    ready.user.name
+                );
+            }
+            Err(e) => error!("Failed to register slash commands: {e:?}"),
+        }
+    }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        let Interaction::Command(command) = interaction else {
+            return;
+        };
+
+        if let Err(e) = handle_stats_interaction(&ctx, &command, self.db.as_ref()).await {
+            warn!("Stats interaction error: {e:?}");
+        }
+    }
+
     // Set a handler for the `message` event. This is called whenever a new message is received.
     //
     // Event handlers are dispatched through a threadpool, and so multiple events can be dispatched
@@ -171,15 +284,6 @@ impl EventHandler for Handler {
 
             if msg.author.id == ctx.cache.current_user().id {
                 return;
-            }
-
-            match handle_stats_command(&ctx, &msg, db.as_ref()).await {
-                Ok(true) => return,
-                Ok(false) => {}
-                Err(e) => {
-                    warn!("Stats command error: {e:?}");
-                    return;
-                }
             }
 
             let update = match (is_weed_time, contains_weed_time) {
