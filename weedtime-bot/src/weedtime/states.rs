@@ -12,6 +12,7 @@ pub trait MapUpdate {
     async fn update(
         ctx: &Context,
         msg: &Message,
+        timezone: Tz,
     ) -> Result<Option<(UserStatsUpdate, GuildStatsUpdate)>, serenity::Error>;
 }
 
@@ -21,6 +22,7 @@ impl MapUpdate for WeedTime {
     async fn update(
         ctx: &Context,
         msg: &Message,
+        timezone: Tz,
     ) -> Result<Option<(UserStatsUpdate, GuildStatsUpdate)>, serenity::Error> {
         let map = get_map(ctx).await.clone();
         let channel_id = msg.channel(&ctx.http).await?.id();
@@ -55,8 +57,8 @@ impl MapUpdate for WeedTime {
                 let has_unique_users = has_unique_elements(weed_time_message.users.iter());
 
                 if weed_time_message.msg.clone().is_some_and(|m| {
-                    let weed_time_timestamp = m.timestamp.with_timezone(&Tz::America__New_York);
-                    let timestamp = msg.timestamp.with_timezone(&Tz::America__New_York);
+                    let weed_time_timestamp = m.timestamp.with_timezone(&timezone);
+                    let timestamp = msg.timestamp.with_timezone(&timezone);
 
                     timestamp.date_naive() == weed_time_timestamp.date_naive()
                         && timestamp.hour() == weed_time_timestamp.hour()
@@ -139,6 +141,7 @@ impl MapUpdate for WeedCrime {
     async fn update(
         ctx: &Context,
         msg: &Message,
+        _timezone: Tz,
     ) -> Result<Option<(UserStatsUpdate, GuildStatsUpdate)>, serenity::Error> {
         let channel_id = msg.channel(&ctx.http).await?.id();
         let mut user_stats = UserStatsUpdate::new(msg.author.id);
@@ -165,6 +168,7 @@ impl MapUpdate for BrokenChain {
     async fn update(
         ctx: &Context,
         msg: &Message,
+        _timezone: Tz,
     ) -> Result<Option<(UserStatsUpdate, GuildStatsUpdate)>, serenity::Error> {
         let map = get_map(ctx).await;
         let mut user_stats = UserStatsUpdate::new(msg.author.id);

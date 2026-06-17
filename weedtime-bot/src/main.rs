@@ -2,24 +2,25 @@ mod weedtime;
 
 use std::{env, error::Error, fs, path::Path, sync::Arc};
 
-use chrono_tz::Tz;
+use chrono_tz::{TZ_VARIANTS, Tz};
 use serenity::{
     Client,
     all::{
         ChannelId, Command, CommandInteraction, CommandOptionType, Context, EventHandler,
-        GatewayIntents, Interaction, Message, Ready, ResolvedValue, User, UserId,
+        GatewayIntents, Interaction, Message, Permissions, Ready, ResolvedValue, User, UserId,
     },
     async_trait,
     builder::{
-        CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedAuthor,
-        CreateInteractionResponse, CreateInteractionResponseMessage,
+        AutocompleteChoice, CreateAutocompleteResponse, CreateCommand, CreateCommandOption,
+        CreateEmbed, CreateEmbedAuthor, CreateInteractionResponse,
+        CreateInteractionResponseMessage,
     },
     model::colour::Colour,
     prelude::TypeMapKey,
 };
 use tracing::{error, warn};
 use weedtime_db::data::v1::{
-    DbUpdate, GuildStats, GuildStatsDatabase, UserStats, UserStatsDatabase,
+    DbUpdate, GuildStats, GuildStatsDatabase, GuildStatsUpdate, UserStats, UserStatsDatabase,
 };
 use whirlwind::ShardMap;
 
@@ -99,6 +100,18 @@ fn stats_commands() -> Vec<CreateCommand> {
                 "The user to show stats for",
             )),
         CreateCommand::new("serverstats").description("Show weed stats for this server"),
+        CreateCommand::new("timezone")
+            .description("Set the timezone this server uses for weed time")
+            .default_member_permissions(Permissions::ADMINISTRATOR)
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "timezone",
+                    "IANA timezone, like America/New_York",
+                )
+                .required(true)
+                .set_autocomplete(true),
+            ),
     ]
 }
 
@@ -181,6 +194,65 @@ async fn respond_with_content(
         .await
 }
 
+fn timezone_choices(input: &str) -> Vec<AutocompleteChoice> {
+    let needle = input.trim().to_lowercase().replace(' ', "_");
+    let mut starts_with = Vec::new();
+    let mut contains = Vec::new();
+
+    for timezone in TZ_VARIANTS {
+        let timezone = timezone.to_string();
+        let comparable = timezone.to_lowercase();
+
+        if needle.is_empty() || comparable.starts_with(&needle) {
+            starts_with.push(timezone);
+        } else if comparable.contains(&needle) {
+            contains.push(timezone);
+        }
+    }
+
+    starts_with
+        .into_iter()
+        .chain(contains)
+        .take(25)
+        .map(AutocompleteChoice::from)
+        .collect()
+}
+
+async fn handle_timezone_autocomplete(
+    ctx: &Context,
+    command: &CommandInteraction,
+) -> Result<(), serenity::Error> {
+    let input = command
+        .data
+        .autocomplete()
+        .map(|option| option.value)
+        .unwrap_or_default();
+
+    command
+        .create_response(
+            ctx,
+            CreateInteractionResponse::Autocomplete(
+                CreateAutocompleteResponse::new().set_choices(timezone_choices(input)),
+            ),
+        )
+        .await
+}
+
+fn guild_timezone(guild_id: Option<serenity::all::GuildId>, db: &WeedTimeDatabases) -> Tz {
+    let Some(guild_id) = guild_id else {
+        return Tz::America__New_York;
+    };
+
+    match db.1.get(guild_id) {
+        Ok(Some(stats)) => stats.timezone,
+        Ok(None) => Tz::America__New_York,
+        Err(e) => {
+            error!("Failed to fetch guild timezone for {guild_id}: {e:?}");
+            Tz::America__New_York
+        }
+    }
+}
+
 async fn handle_user_stats_command(
     ctx: &Context,
     command: &CommandInteraction,
@@ -230,6 +302,56 @@ async fn handle_guild_stats_command(
     respond_with_embed(ctx, command, guild_stats_embed(guild.name, icon_url, stats)).await
 }
 
+async fn handle_timezone_command(
+    ctx: &Context,
+    command: &CommandInteraction,
+    db: &WeedTimeDatabases,
+) -> Result<(), serenity::Error> {
+    let Some(guild_id) = command.guild_id else {
+        return respond_with_content(ctx, command, "Timezone can only be set in a server.").await;
+    };
+
+    let Some(timezone_input) =
+        command
+            .data
+            .options()
+            .into_iter()
+            .find_map(|option| match option.value {
+                ResolvedValue::String(value) if option.name == "timezone" => Some(value),
+                _ => None,
+            })
+    else {
+        return respond_with_content(ctx, command, "Missing timezone.").await;
+    };
+
+    let Ok(timezone) = timezone_input.parse::<Tz>() else {
+        return respond_with_content(
+            ctx,
+            command,
+            format!("`{timezone_input}` is not a valid IANA timezone."),
+        )
+        .await;
+    };
+
+    let update = GuildStatsUpdate {
+        guild_id: Some(guild_id),
+        timezone: Some(timezone),
+        ..Default::default()
+    };
+
+    if let Err(e) = update.commit(&db.1) {
+        error!("Failed to update timezone for {guild_id}: {e:?}");
+        return respond_with_content(ctx, command, "Failed to save the server timezone.").await;
+    }
+
+    respond_with_content(
+        ctx,
+        command,
+        format!("Server timezone set to `{timezone}`."),
+    )
+    .await
+}
+
 async fn handle_stats_interaction(
     ctx: &Context,
     command: &CommandInteraction,
@@ -238,6 +360,17 @@ async fn handle_stats_interaction(
     match command.data.name.as_str() {
         "userstats" => handle_user_stats_command(ctx, command, db).await,
         "serverstats" => handle_guild_stats_command(ctx, command, db).await,
+        "timezone" => handle_timezone_command(ctx, command, db).await,
+        _ => Ok(()),
+    }
+}
+
+async fn handle_autocomplete_interaction(
+    ctx: &Context,
+    command: &CommandInteraction,
+) -> Result<(), serenity::Error> {
+    match command.data.name.as_str() {
+        "timezone" => handle_timezone_autocomplete(ctx, command).await,
         _ => Ok(()),
     }
 }
@@ -258,12 +391,18 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        let Interaction::Command(command) = interaction else {
-            return;
-        };
-
-        if let Err(e) = handle_stats_interaction(&ctx, &command, self.db.as_ref()).await {
-            warn!("Stats interaction error: {e:?}");
+        match interaction {
+            Interaction::Command(command) => {
+                if let Err(e) = handle_stats_interaction(&ctx, &command, self.db.as_ref()).await {
+                    warn!("Slash command error: {e:?}");
+                }
+            }
+            Interaction::Autocomplete(command) => {
+                if let Err(e) = handle_autocomplete_interaction(&ctx, &command).await {
+                    warn!("Autocomplete error: {e:?}");
+                }
+            }
+            _ => {}
         }
     }
 
@@ -277,7 +416,8 @@ impl EventHandler for Handler {
         let db = self.db.clone();
 
         tokio::spawn(async move {
-            let timestamp = (*msg.timestamp).with_timezone::<Tz>(&Tz::America__New_York);
+            let timezone = guild_timezone(msg.guild_id, db.as_ref());
+            let timestamp = msg.timestamp.with_timezone(&timezone);
 
             let is_weed_time = is_420(timestamp);
             let contains_weed_time = msg.content.to_lowercase().contains("weed time");
@@ -287,9 +427,9 @@ impl EventHandler for Handler {
             }
 
             let update = match (is_weed_time, contains_weed_time) {
-                (false, true) => WeedCrime::update(&ctx, &msg).await,
-                (true, false) => BrokenChain::update(&ctx, &msg).await,
-                (true, true) => WeedTime::update(&ctx, &msg).await,
+                (false, true) => WeedCrime::update(&ctx, &msg, timezone).await,
+                (true, false) => BrokenChain::update(&ctx, &msg, timezone).await,
+                (true, true) => WeedTime::update(&ctx, &msg, timezone).await,
                 _ => Ok(None),
             };
 
