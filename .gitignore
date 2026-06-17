@@ -1,2 +1,3 @@
 weedtime-bot/target
 weedtime-db/target
+weedtime-bot/data/*.db

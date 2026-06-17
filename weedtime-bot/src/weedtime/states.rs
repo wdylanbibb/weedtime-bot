@@ -24,6 +24,8 @@ impl MapUpdate for WeedTime {
     ) -> Result<Option<(UserStatsUpdate, GuildStatsUpdate)>, serenity::Error> {
         let map = get_map(ctx).await.clone();
         let channel_id = msg.channel(&ctx.http).await?.id();
+        let mut user_stats = UserStatsUpdate::new(msg.author.id);
+        let mut guild_stats = msg.guild_id.map(GuildStatsUpdate::new).unwrap_or_default();
         let new_msg = channel_id
             .send_files(
                 &ctx.http,
@@ -50,8 +52,7 @@ impl MapUpdate for WeedTime {
             Some(mut weed_time_message) => {
                 weed_time_message.users.push(msg.author.id);
 
-                // let has_unique_users = has_unique_elements(weed_time_message.users.iter());
-                let has_unique_users = true;
+                let has_unique_users = has_unique_elements(weed_time_message.users.iter());
 
                 if weed_time_message.msg.clone().is_some_and(|m| {
                     let weed_time_timestamp = m.timestamp.with_timezone(&Tz::America__New_York);
@@ -74,12 +75,9 @@ impl MapUpdate for WeedTime {
                         weed_time_message.count
                     );
 
-                    // DB Updates:
-                    //   UserStats:
-                    //     Weed Times + 1
-                    //   GuildStats:
-                    //     Weed Times + 1
-                    //     Longest Chain Check
+                    user_stats.weed_times += 1;
+                    guild_stats.weed_times += 1;
+                    guild_stats.longest_chain = Some(weed_time_message.count);
                 } else {
                     // Chain broken or new weed time
                     weed_time_message.msg = Some(new_msg);
@@ -90,15 +88,13 @@ impl MapUpdate for WeedTime {
                         "Non-unique user or new weed time. Restarting channel entry here."
                     );
 
-                    // DB Updates:
-                    //   UserStats:
-                    //     Weed Times + 1
-                    //     Chains Started + 1
-                    //     if !has_unique_users:
-                    //       Chains Broken + 1
-                    //   GuildStats:
-                    //     Weed Times + 1
-                    //     Longest Chain Check
+                    user_stats.weed_times += 1;
+                    user_stats.chains_started += 1;
+                    if !has_unique_users {
+                        user_stats.chains_broken += 1;
+                    }
+                    guild_stats.weed_times += 1;
+                    guild_stats.longest_chain = Some(weed_time_message.count);
                 }
             }
             None => {
@@ -109,13 +105,10 @@ impl MapUpdate for WeedTime {
                 });
                 tracing::info!("Inserting channel entry.");
 
-                // DB Updates:
-                //   UserStats:
-                //     Weed Times + 1
-                //     Chains Started + 1
-                //   GuildStats:
-                //     Weed Times + 1
-                //     Longest Chain Check
+                user_stats.weed_times += 1;
+                user_stats.chains_started += 1;
+                guild_stats.weed_times += 1;
+                guild_stats.longest_chain = Some(1);
             }
         }
 
@@ -136,7 +129,7 @@ impl MapUpdate for WeedTime {
             }
         }
 
-        Ok(Some((UserStatsUpdate, GuildStatsUpdate)))
+        Ok(Some((user_stats, guild_stats)))
     }
 }
 
@@ -148,6 +141,8 @@ impl MapUpdate for WeedCrime {
         msg: &Message,
     ) -> Result<Option<(UserStatsUpdate, GuildStatsUpdate)>, serenity::Error> {
         let channel_id = msg.channel(&ctx.http).await?.id();
+        let mut user_stats = UserStatsUpdate::new(msg.author.id);
+        let mut guild_stats = msg.guild_id.map(GuildStatsUpdate::new).unwrap_or_default();
 
         channel_id
             .send_files(
@@ -157,13 +152,10 @@ impl MapUpdate for WeedCrime {
             )
             .await?;
 
-        // DB Updates:
-        //   UserStats:
-        //     Weed Crimes + 1
-        //   GuildStats:
-        //     Weed Crimes + 1
+        user_stats.weed_crimes += 1;
+        guild_stats.weed_crimes += 1;
 
-        Ok(Some((UserStatsUpdate, GuildStatsUpdate)))
+        Ok(Some((user_stats, guild_stats)))
     }
 }
 
@@ -175,6 +167,7 @@ impl MapUpdate for BrokenChain {
         msg: &Message,
     ) -> Result<Option<(UserStatsUpdate, GuildStatsUpdate)>, serenity::Error> {
         let map = get_map(ctx).await;
+        let mut user_stats = UserStatsUpdate::new(msg.author.id);
 
         if let Some(mut weed_time_message) = map.get_mut(&msg.channel(&ctx.http).await?.id()).await
         {
@@ -184,13 +177,9 @@ impl MapUpdate for BrokenChain {
             tracing::info!("Chain broken, resetting channel entry.");
         }
 
-        // DB Updates:
-        //   UserStats:
-        //     Chains Broken + 1
-        //   GuildStats:
-        //     --
+        user_stats.chains_broken += 1;
 
-        Ok(Some((UserStatsUpdate, GuildStatsUpdate)))
+        Ok(Some((user_stats, GuildStatsUpdate::default())))
     }
 }
 
